@@ -45,6 +45,7 @@ export const PositionStyleClass = Object.freeze([
  */
 export class ThemeManager {
     constructor(dock) {
+        this._destroyed = false;
         this._signalsHandler = new Utils.GlobalSignalsHandler(this);
         this._bindSettingsChanges();
         this._actor = dock;
@@ -72,6 +73,9 @@ export class ThemeManager {
             Utils.SignalsHandlerFlags.CONNECT_AFTER);
 
         const maybeUpdateCustomTheme = () => {
+            if (this._destroyed)
+                return;
+
             if (this._actor.mapped) {
                 this._signalsHandler.unblockWithLabel(Labels.THEME_CHANGED);
                 this._queueUpdateCustomTheme();
@@ -99,13 +103,17 @@ export class ThemeManager {
     }
 
     destroy() {
+        if (this._destroyed)
+            return;
+
+        this._destroyed = true;
+        this._dequeueUpdateCustomTheme();
         this.emit('destroy');
         this._transparency.destroy();
-        this._dequeueUpdateCustomTheme();
     }
 
     _queueUpdateCustomTheme() {
-        if (this._updateLater)
+        if (this._destroyed || this._updateLater)
             return;
 
         this._updateLater = Utils.laterAdd(Meta.LaterType.BEFORE_REDRAW, () => {
@@ -258,7 +266,7 @@ export class ThemeManager {
     }
 
     updateCustomTheme() {
-        if (!this._actor.mapped)
+        if (this._destroyed || !this._actor.mapped)
             return;
 
         this._updateCustomStyleClasses();
@@ -372,11 +380,16 @@ class Transparency {
         this._opaqueTransition = '0ms';
         this._base_actor_style = '';
 
+        this._destroyed = false;
         this._signalsHandler = new Utils.GlobalSignalsHandler();
         this._trackedWindows = new Map();
+        this._dockDestroyId = this._dockActor.connect('destroy', () => this.destroy());
     }
 
     enable() {
+        if (this._destroyed)
+            return;
+
         // ensure I never double-register/inject
         // although it should never happen
         this.disable();
@@ -441,9 +454,13 @@ class Transparency {
         // although it should never happen
         this._signalsHandler.removeWithLabel(Labels.TRANSPARENCY);
 
-        for (const key of this._trackedWindows.keys()) {
-            this._trackedWindows.get(key).forEach(id => {
-                key.disconnect(id);
+        for (const [key, signalIds] of this._trackedWindows.entries()) {
+            signalIds.forEach(id => {
+                try {
+                    key.disconnect(id);
+                } catch {
+                    // Window actor may already be disposed
+                }
             });
         }
         this._trackedWindows.clear();
@@ -452,42 +469,76 @@ class Transparency {
     }
 
     destroy() {
+        if (this._destroyed)
+            return;
+
+        this._destroyed = true;
+        if (this._dockDestroyId) {
+            const id = this._dockDestroyId;
+            this._dockDestroyId = 0;
+            try {
+                this._dockActor.disconnect(id);
+            } catch {
+                // Dock actor may already be disposed
+            }
+        }
         this.disable();
         this._signalsHandler.destroy();
     }
 
     _onWindowActorAdded(container, metaWindowActor) {
+        if (this._destroyed || this._trackedWindows.has(metaWindowActor))
+            return;
+
         const signalIds = [];
         ['notify::allocation', 'notify::visible'].forEach(s => {
             signalIds.push(metaWindowActor.connect(s, this._updateSolidStyle.bind(this)));
         });
+        signalIds.push(metaWindowActor.connect('destroy', () =>
+            this._onWindowActorRemoved(container, metaWindowActor)));
         this._trackedWindows.set(metaWindowActor, signalIds);
     }
 
     _onWindowActorRemoved(container, metaWindowActor) {
-        if (!this._trackedWindows.get(metaWindowActor))
+        const signalIds = this._trackedWindows.get(metaWindowActor);
+        if (!signalIds)
             return;
 
-        this._trackedWindows.get(metaWindowActor).forEach(id => {
-            metaWindowActor.disconnect(id);
-        });
         this._trackedWindows.delete(metaWindowActor);
+        signalIds.forEach(id => {
+            try {
+                metaWindowActor.disconnect(id);
+            } catch {
+                // Window actor may already be disposed
+            }
+        });
         this._updateSolidStyle();
     }
 
     _updateSolidStyle() {
-        const isNear = this._dockIsNear();
-        if (isNear) {
-            this._backgroundActor.set_style(this._opaque_style);
-            this._dockActor.remove_style_class_name('transparent');
-            this._dockActor.add_style_class_name('opaque');
-        } else {
-            this._backgroundActor.set_style(this._transparent_style);
-            this._dockActor.remove_style_class_name('opaque');
-            this._dockActor.add_style_class_name('transparent');
-        }
+        if (this._destroyed)
+            return;
 
-        this.emit('solid-style-updated', isNear);
+        try {
+            const isNear = this._dockIsNear();
+            if (isNear) {
+                this._backgroundActor.set_style(this._opaque_style);
+                this._dockActor.remove_style_class_name('transparent');
+                this._dockActor.add_style_class_name('opaque');
+            } else {
+                this._backgroundActor.set_style(this._transparent_style);
+                this._dockActor.remove_style_class_name('opaque');
+                this._dockActor.add_style_class_name('transparent');
+            }
+
+            this.emit('solid-style-updated', isNear);
+        } catch (e) {
+            if (!this._destroyed && String(e).includes('already disposed')) {
+                this.destroy();
+                return;
+            }
+            throw e;
+        }
     }
 
     _dockIsNear() {
@@ -588,6 +639,7 @@ class Transparency {
         this._transparentTransition = themeNode.get_transition_duration();
 
         Main.uiGroup.remove_child(dummyObject);
+        dummyObject.destroy();
 
         const {settings} = Docking.DockManager;
 
